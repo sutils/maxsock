@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -326,6 +327,7 @@ type ConsistentReader struct {
 	running    bool
 	BufferSize int
 	Offset     int
+	QueueMax   int
 	//
 	event      ConsistentReaderEvent
 	currentIdx uint16
@@ -333,7 +335,7 @@ type ConsistentReader struct {
 	Heartbeat  time.Duration
 }
 
-func NewConsistentReader(event ConsistentReaderEvent, raw io.Reader, bufferSize, readChanSize int) (reader *ConsistentReader) {
+func NewConsistentReader(event ConsistentReaderEvent, raw io.Reader, bufferSize, readChanSize, queueMax int) (reader *ConsistentReader) {
 	reader = &ConsistentReader{
 		Raw:        raw,
 		readChan:   make(chan []byte, readChanSize),
@@ -342,6 +344,7 @@ func NewConsistentReader(event ConsistentReaderEvent, raw io.Reader, bufferSize,
 		event:      event,
 		running:    true,
 		Heartbeat:  500 * time.Millisecond,
+		QueueMax:   queueMax,
 	}
 	go reader.runRead()
 	go reader.runTask()
@@ -352,6 +355,9 @@ func NewConsistentReader(event ConsistentReaderEvent, raw io.Reader, bufferSize,
 func (c *ConsistentReader) runHeartbeat() {
 	for c.running {
 		time.Sleep(c.Heartbeat)
+		if len(c.missing) > 1000 {
+			panic("xxxx->")
+		}
 		c.event.OnSendHeartbeat(c, c.currentIdx, c.missing)
 	}
 	c.running = false
@@ -371,6 +377,8 @@ func (c *ConsistentReader) runTask() {
 				missing = append(missing, binary.BigEndian.Uint16(buf[4+2*i:]))
 			}
 			c.event.OnRecvHeartbeat(c, binary.BigEndian.Uint16(buf[2:]), missing)
+		} else if buf[0] == 20 {
+			c.event.OnSendHeartbeat(c, c.currentIdx, c.missing)
 		}
 	}
 }
@@ -378,7 +386,7 @@ func (c *ConsistentReader) runTask() {
 func (c *ConsistentReader) runRead() {
 	log.D("ConsistentReader(%v) read runner is starting", c)
 	received := map[uint16][]byte{}
-	var receivedMax uint16
+	var receivedMax, dmax uint16
 	for c.running {
 		rawBuf := make([]byte, c.BufferSize)
 		readed, err := c.Raw.Read(rawBuf)
@@ -396,16 +404,30 @@ func (c *ConsistentReader) runRead() {
 		dataIdx := binary.BigEndian.Uint16(buf[2:])
 		received[dataIdx] = rawBuf
 		{ //for heartbeat missing data
-			if receivedMax < dataIdx {
-				receivedMax = dataIdx
+			disVal := int64(dataIdx) - int64(c.currentIdx)
+			if disVal < 0 {
+				disVal += math.MaxUint16
+			}
+			if receivedMax < uint16(disVal) {
+				receivedMax = uint16(disVal)
+			}
+			if dmax < dataIdx {
+				dmax = dataIdx
 			}
 			missing := []uint16{}
-			for i := c.currentIdx; i < receivedMax; i++ {
-				if received[i] == nil {
-					missing = append(missing, i)
+			for i := uint16(0); i < receivedMax; i++ {
+				if received[c.currentIdx+i] == nil {
+					missing = append(missing, c.currentIdx+i)
 				}
 			}
 			c.missing = missing
+			// fmt.Println("--->", c.currentIdx, dataIdx, receivedMax, missing, dmax, adis)
+			//98 98 4 [99 100 101] 98
+			if len(missing) > c.QueueMax/2 {
+				taskBuf := make([]byte, c.Offset+1)
+				taskBuf[c.Offset] = 20
+				c.taskChan <- taskBuf
+			}
 		}
 		{ //pipe data to read
 			for c.running {
@@ -416,6 +438,9 @@ func (c *ConsistentReader) runRead() {
 				c.readChan <- data
 				delete(received, c.currentIdx)
 				c.currentIdx++
+				if receivedMax > 0 {
+					receivedMax--
+				}
 			}
 		}
 	}
@@ -435,6 +460,10 @@ func (c *ConsistentReader) Read(p []byte) (n int, err error) {
 	return
 }
 
+func (c *ConsistentReader) String() string {
+	return fmt.Sprintf("%p,%v,%v,%v", c, c.Offset, c.currentIdx, c.Heartbeat)
+}
+
 //ConsistentWriter is the writer to process data to be consistent
 //more 4 byte is required when process write buffer, real data is 4 byte offset from begin.
 type ConsistentWriter struct {
@@ -443,26 +472,34 @@ type ConsistentWriter struct {
 	Copy   bool      //copy buffer to quque after write, default is false
 	//
 	writeLck   chan int
+	writeLimit chan int
 	currentIdx uint16
-	quque      map[uint16][]byte
-	ququeLck   chan int
+	queue      map[uint16][]byte
+	queueLck   chan int
 	queuedIdx  uint16
+	QueueMax   uint16
 }
 
-func NewConsistentWriter(raw io.Writer) (writer *ConsistentWriter) {
+func NewConsistentWriter(raw io.Writer, queueMax uint16) (writer *ConsistentWriter) {
 	writer = &ConsistentWriter{
-		Raw:      raw,
-		writeLck: make(chan int, 1),
-		quque:    map[uint16][]byte{},
-		ququeLck: make(chan int, 1),
+		Raw:        raw,
+		writeLck:   make(chan int, 1),
+		writeLimit: make(chan int, queueMax),
+		queue:      map[uint16][]byte{},
+		queueLck:   make(chan int, 1),
+		QueueMax:   queueMax,
 	}
 	writer.writeLck <- 1
-	writer.ququeLck <- 1
+	writer.queueLck <- 1
+	for i := uint16(0); i < queueMax; i++ {
+		writer.writeLimit <- 1
+	}
 	return
 }
 
 //4 byte offset
 func (c *ConsistentWriter) Write(p []byte) (n int, err error) {
+	<-c.writeLimit
 	//
 	//do idx
 	<-c.writeLck
@@ -479,10 +516,10 @@ func (c *ConsistentWriter) Write(p []byte) (n int, err error) {
 		cached = make([]byte, len(p))
 		copy(cached, p)
 	}
-	<-c.ququeLck
-	c.quque[currentIdx] = cached
+	<-c.queueLck
+	c.queue[currentIdx] = cached
 	c.queuedIdx = currentIdx + 1
-	c.ququeLck <- 1
+	c.queueLck <- 1
 	//
 	//do write
 	n, err = c.Raw.Write(p)
@@ -499,23 +536,34 @@ func (c *ConsistentWriter) OnSendHeartbeat(cr *ConsistentReader, current uint16,
 	}
 	_, err = c.Raw.Write(rawBuf)
 	if err != nil {
-		log.D("ConsistentWriter send heartbeat message fail with %v", err)
-	} else {
-		log.D("ConsistentWriter send heartbeat message success with current:%v,missing:%v", current, missing)
+		log.D("ConsistentWriter(%v) send heartbeat message fail with %v", c, err)
+	} else if ShowLog > 1 {
+		log.D("ConsistentWriter(%v) send heartbeat message success with current:%v,missing:%v", c, current, missing)
 	}
 	return
 }
 
 func (c *ConsistentWriter) OnRecvHeartbeat(cr *ConsistentReader, current uint16, missing []uint16) (err error) {
-	<-c.ququeLck
-	log.D("ConsistentWriter recv heartbeat message success with current(local:%v,remote:%v),missing:%v,", c.queuedIdx, current, missing)
-	for dataIdx := range c.quque {
-		if dataIdx < current {
-			delete(c.quque, dataIdx)
+	<-c.queueLck
+	if ShowLog > 1 {
+		log.D("ConsistentWriter(%v) recv heartbeat message success with current(local:%v,remote:%v),missing:%v,", c, c.queuedIdx, current, missing)
+	}
+	queueMax := current + c.QueueMax
+	for dataIdx := range c.queue {
+		if queueMax >= current {
+			if dataIdx < current || dataIdx > queueMax {
+				delete(c.queue, dataIdx)
+				c.writeLimit <- 1
+			}
+		} else {
+			if dataIdx > queueMax && dataIdx < current {
+				delete(c.queue, dataIdx)
+				c.writeLimit <- 1
+			}
 		}
 	}
 	if c.queuedIdx == current {
-		c.ququeLck <- 1
+		c.queueLck <- 1
 		return
 	}
 	allMissing := map[uint16]bool{}
@@ -530,27 +578,31 @@ func (c *ConsistentWriter) OnRecvHeartbeat(cr *ConsistentReader, current uint16,
 	}
 	allBuf := [][]byte{}
 	for m := range allMissing {
-		rawBuf := c.quque[m]
+		rawBuf := c.queue[m]
 		if rawBuf == nil {
 			err = fmt.Errorf("cache not found(logic error)")
-			log.E("ConsistentWriter write missing message fail with cache(%v) not found on queue(%v),logic error", m, len(c.quque))
+			log.E("ConsistentWriter(%v) write missing message fail with cache(%v) not found on queue(%v),logic error", c, m, len(c.queue))
 			break
 		}
 		allBuf = append(allBuf, rawBuf)
 	}
-	c.ququeLck <- 1
+	c.queueLck <- 1
 	if len(allBuf) > 0 {
-		log.D("ConsistentWriter will resend %v data", len(allBuf))
+		log.D("ConsistentWriter(%v) will resend %v data", c, len(allBuf))
 		for _, rawBuf := range allBuf {
 			_, err = c.Raw.Write(rawBuf)
 			if err != nil {
-				log.D("ConsistentWriter write missing message fail with %v", err)
+				log.D("ConsistentWriter(%v) write missing message fail with %v", c, err)
 				break
 			}
 		}
-		log.D("ConsistentWriter resend %v data done", len(allBuf))
+		log.D("ConsistentWriter(%v) resend %v data done", c, len(allBuf))
 	}
 	return
+}
+
+func (c *ConsistentWriter) String() string {
+	return fmt.Sprintf("%p,%v,%v,%v", c, c.Offset, c.currentIdx, c.Copy)
 }
 
 type BindedReaderEvent interface {
@@ -793,6 +845,10 @@ func NewFrameWriter(raw io.Writer) (writer *FrameWriter) {
 //so the total size of buffer is 4 byte more than the data size.
 func (f *FrameWriter) Write(p []byte) (n int, err error) {
 	binary.BigEndian.PutUint32(p, uint32(len(p)))
+	if len(p) > 1000 {
+		fmt.Println("--->", p)
+		panic("errro")
+	}
 	n, err = f.Raw.Write(p)
 	return
 }
@@ -848,4 +904,33 @@ func (n *NoneCloserReadWriter) Close() (err error) {
 
 func (n *NoneCloserReadWriter) String() string {
 	return fmt.Sprintf("%v,%v", n.Reader, n.Writer)
+}
+
+type AutoCloseReadWriter struct {
+	io.Reader
+	io.Writer
+}
+
+func NewAutoCloseReadWriter(reader io.Reader, writer io.Writer) *AutoCloseReadWriter {
+	return &AutoCloseReadWriter{Reader: reader, Writer: writer}
+}
+
+func (a *AutoCloseReadWriter) Close() (err error) {
+	if closer, ok := a.Reader.(io.Closer); ok {
+		xerr := closer.Close()
+		if xerr != nil {
+			err = xerr
+		}
+	}
+	if closer, ok := a.Writer.(io.Closer); ok {
+		xerr := closer.Close()
+		if xerr != nil {
+			err = xerr
+		}
+	}
+	return
+}
+
+func (a *AutoCloseReadWriter) String() string {
+	return fmt.Sprintf("%v,%v", a.Reader, a.Writer)
 }

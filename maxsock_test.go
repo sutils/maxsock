@@ -5,12 +5,14 @@ import (
 	"io"
 	"net/http"
 	_ "net/http/pprof"
+	"runtime"
 	"sync/atomic"
 	"testing"
 	"time"
 )
 
 func init() {
+	runtime.GOMAXPROCS(8)
 	go http.ListenAndServe(":2722", nil)
 }
 
