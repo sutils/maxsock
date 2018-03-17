@@ -314,27 +314,31 @@ func WriteJSON(w io.Writer, head byte, v interface{}) (n int, err error) {
 	return
 }
 
+//ConsistentReaderEvent is the interface of ConsistentReader
 type ConsistentReaderEvent interface {
 	OnSendHeartbeat(c *ConsistentReader, current uint16, missing []uint16) (err error)
 	OnRecvHeartbeat(c *ConsistentReader, current uint16, missing []uint16) (err error)
 }
 
+//ConsistentReader is the reader to process data to be consistent
+//more 4 byte is required when process read buffer, real data is 4 byte offset from begin.
 type ConsistentReader struct {
-	Raw        io.Reader
+	Raw        io.Reader     //the raw reader.
+	BufferSize int           //the buffer size of read runner.
+	Offset     int           //the offset position of write buffer to append the consistent info(4 byte)
+	QueueMax   int           //the max of queued data
+	Heartbeat  time.Duration //the deplay of heartbeat.
+	//
 	readChan   chan []byte
 	taskChan   chan []byte
 	readErr    error
 	running    bool
-	BufferSize int
-	Offset     int
-	QueueMax   int
-	//
 	event      ConsistentReaderEvent
 	currentIdx uint16
 	missing    []uint16
-	Heartbeat  time.Duration
 }
 
+//NewConsistentReader is the creator of ConsistentReader by event handler, raw writer, buffer size, read cache size and the max of queued data
 func NewConsistentReader(event ConsistentReaderEvent, raw io.Reader, bufferSize, readChanSize, queueMax int) (reader *ConsistentReader) {
 	reader = &ConsistentReader{
 		Raw:        raw,
@@ -362,6 +366,7 @@ func (c *ConsistentReader) runHeartbeat() {
 	}
 	c.running = false
 }
+
 func (c *ConsistentReader) runTask() {
 	for c.running {
 		rawBuf := <-c.taskChan
@@ -384,7 +389,9 @@ func (c *ConsistentReader) runTask() {
 }
 
 func (c *ConsistentReader) runRead() {
-	log.D("ConsistentReader(%v) read runner is starting", c)
+	if ShowLog > 0 {
+		log.D("ConsistentReader(%v) read runner is starting", c)
+	}
 	received := map[uint16][]byte{}
 	var receivedMax, dmax uint16
 	for c.running {
@@ -446,7 +453,9 @@ func (c *ConsistentReader) runRead() {
 	}
 	close(c.readChan)
 	c.running = false
-	log.D("ConsistentReader(%v) read runner is stopped", c)
+	if ShowLog > 0 {
+		log.D("ConsistentReader(%v) read runner is stopped", c)
+	}
 }
 
 func (c *ConsistentReader) Read(p []byte) (n int, err error) {
@@ -480,6 +489,7 @@ type ConsistentWriter struct {
 	QueueMax   uint16
 }
 
+//NewConsistentWriter is the creator of ConsistentWriter by raw writer and the max of queued data
 func NewConsistentWriter(raw io.Writer, queueMax uint16) (writer *ConsistentWriter) {
 	writer = &ConsistentWriter{
 		Raw:        raw,
@@ -497,7 +507,6 @@ func NewConsistentWriter(raw io.Writer, queueMax uint16) (writer *ConsistentWrit
 	return
 }
 
-//4 byte offset
 func (c *ConsistentWriter) Write(p []byte) (n int, err error) {
 	<-c.writeLimit
 	//
@@ -526,6 +535,7 @@ func (c *ConsistentWriter) Write(p []byte) (n int, err error) {
 	return
 }
 
+//OnSendHeartbeat is the ConsistentReader event hanndler.
 func (c *ConsistentWriter) OnSendHeartbeat(cr *ConsistentReader, current uint16, missing []uint16) (err error) {
 	rawBuf := make([]byte, len(missing)*2+c.Offset+4)
 	buf := rawBuf[c.Offset:]
@@ -543,6 +553,7 @@ func (c *ConsistentWriter) OnSendHeartbeat(cr *ConsistentReader, current uint16,
 	return
 }
 
+//OnRecvHeartbeat is the ConsistentReader event hanndler.
 func (c *ConsistentWriter) OnRecvHeartbeat(cr *ConsistentReader, current uint16, missing []uint16) (err error) {
 	<-c.queueLck
 	if ShowLog > 1 {
@@ -605,10 +616,13 @@ func (c *ConsistentWriter) String() string {
 	return fmt.Sprintf("%p,%v,%v,%v", c, c.Offset, c.currentIdx, c.Copy)
 }
 
+//BindedReaderEvent is the interface of the BindedReader event.
 type BindedReaderEvent interface {
+	//call it on the runner of per raw reader is stopped.
 	OnRawDone(b *BindedReader, raw io.Reader, err error)
 }
 
+//BindedReader impl the reader which can bind multi raw reader to one and balanced.
 type BindedReader struct {
 	BufferSize int
 	Max        int
@@ -620,6 +634,7 @@ type BindedReader struct {
 	running    bool
 }
 
+//NewBindedReader is the creator of BindedReader by read buffer size, read chan cache size, and pool size.
 func NewBindedReader(bufferSize, readChanSize, max int) (reader *BindedReader) {
 	reader = &BindedReader{
 		BufferSize: bufferSize,
@@ -633,6 +648,7 @@ func NewBindedReader(bufferSize, readChanSize, max int) (reader *BindedReader) {
 	return
 }
 
+//Bind a raw reader to pool
 func (b *BindedReader) Bind(raw io.ReadCloser) (err error) {
 	<-b.bindedLck
 	if b.running {
@@ -651,7 +667,9 @@ func (b *BindedReader) Bind(raw io.ReadCloser) (err error) {
 }
 
 func (b *BindedReader) runRead(raw io.ReadCloser) {
-	log.D("BindedReader(%v) raw reader is starting", b)
+	if ShowLog > 0 {
+		log.D("BindedReader(%v) raw reader is starting", b)
+	}
 	var readed int
 	var err error
 	for {
@@ -668,7 +686,9 @@ func (b *BindedReader) runRead(raw io.ReadCloser) {
 	if b.Event != nil && b.running {
 		b.Event.OnRawDone(b, raw, err)
 	}
-	log.D("BindedReader(%v) raw reader is done with error:%v", b, err)
+	if ShowLog > 0 {
+		log.D("BindedReader(%v) raw reader is done with error:%v", b, err)
+	}
 }
 
 func (b *BindedReader) Read(p []byte) (n int, err error) {
@@ -682,6 +702,7 @@ func (b *BindedReader) Read(p []byte) (n int, err error) {
 	return
 }
 
+//Close all binded raw reader.
 func (b *BindedReader) Close() (err error) {
 	<-b.bindedLck
 	b.running = false
@@ -699,6 +720,7 @@ func (b *BindedReader) String() string {
 	return fmt.Sprintf("%p,%v", b, b.Max)
 }
 
+//BindedWriter impl the writer whihc can bind mulit raw writer to one and balanced.
 type BindedWriter struct {
 	Max        int
 	binded     map[io.WriteCloser]int
@@ -707,6 +729,7 @@ type BindedWriter struct {
 	running    bool
 }
 
+//NewBindedWriter is the creator of BindedWriter by max size of pool
 func NewBindedWriter(max int) (writer *BindedWriter) {
 	writer = &BindedWriter{
 		Max:        max,
@@ -719,6 +742,7 @@ func NewBindedWriter(max int) (writer *BindedWriter) {
 	return
 }
 
+//Bind one raw writer to pool
 func (b *BindedWriter) Bind(raw io.WriteCloser) (err error) {
 	<-b.bindedLck
 	if b.running {
@@ -753,6 +777,7 @@ func (b *BindedWriter) Write(p []byte) (n int, err error) {
 	return
 }
 
+//Close all binded raw writer
 func (b *BindedWriter) Close() (err error) {
 	<-b.bindedLck
 	b.running = false
