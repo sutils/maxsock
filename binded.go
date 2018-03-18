@@ -10,12 +10,14 @@ import (
 	"sync/atomic"
 
 	"github.com/Centny/gwf/log"
+	"github.com/Centny/gwf/util"
 )
 
 type AuthOption struct {
-	Name    string `json:"name"`
-	Session uint32 `json:"session"`
-	Error   error  `json:"error"`
+	Name    string   `json:"name"`
+	Session uint32   `json:"session"`
+	Error   error    `json:"error"`
+	Options util.Map `json:"options`
 }
 
 func WriteJSON(w io.Writer, offset int, v interface{}) (n int, err error) {
@@ -40,12 +42,17 @@ func hashSha1(authKey string, data []byte) (hash []byte) {
 	return
 }
 
+type BindedAcceptorEvent interface {
+	OnAccept(b *BindedAcceptor, channel io.ReadWriteCloser, option *AuthOption) (err error)
+}
+
 type BindedAcceptor struct {
 	BufferSize   int
 	Offset       int
 	ReadChanSize int
 	BindMax      int
 	AuthKey      map[string]string
+	Event        BindedAcceptorEvent
 
 	allBinded  map[uint32]*BindedReadWriter
 	bindedLck  sync.RWMutex
@@ -66,14 +73,15 @@ func NewBindedAcceptor(bufferSize, readChanSize, bindMax int) (acceptor *BindedA
 	return
 }
 
-func (b *BindedAcceptor) Accept(channel io.ReadWriteCloser) (binded *BindedReadWriter, err error) {
+func (b *BindedAcceptor) Accept(channel io.ReadWriteCloser) (option *AuthOption, binded *BindedReadWriter, err error) {
 	buf := make([]byte, b.BufferSize)
 	readed, err := channel.Read(buf)
 	if err != nil {
 		return
 	}
 	buf = buf[:readed]
-	option, back := &AuthOption{}, &AuthOption{}
+	option = &AuthOption{}
+	back := &AuthOption{}
 	err = json.Unmarshal(buf[b.Offset+20:], option)
 	if err != nil {
 		err = fmt.Errorf("pass auth option fail with %v", err)
@@ -96,8 +104,15 @@ func (b *BindedAcceptor) Accept(channel io.ReadWriteCloser) (binded *BindedReadW
 		return
 	}
 	//
-	//do acl
-
+	if b.Event != nil {
+		err = b.Event.OnAccept(b, channel, option)
+		if err != nil {
+			back.Error = err
+			log.W("BindedAcceptor(%v) event on accept fail with %v", b, err)
+			_, err = WriteJSON(channel, b.Offset, back)
+			return
+		}
+	}
 	//
 	if option.Session > 0 {
 		b.bindedLck.Lock()
@@ -127,6 +142,7 @@ func (b *BindedAcceptor) Accept(channel io.ReadWriteCloser) (binded *BindedReadW
 	_, err = WriteJSON(channel, b.Offset, back)
 	if err == nil {
 		binded = NewBindedReadWriter(b.BufferSize, b.ReadChanSize, b.BindMax)
+		binded.Userinfo = option
 		b.bindedLck.Lock()
 		b.allBinded[back.Session] = binded
 		b.bindedLck.Unlock()
@@ -166,11 +182,16 @@ func NewBindedConnector(name, authKey string, bufferSize, readChanSize, bindMax 
 	return
 }
 
-func (b *BindedConnector) Connect(session uint32, channel io.ReadWriteCloser) (newSession uint32, binded *BindedReadWriter, err error) {
-	data, _ := json.Marshal(&AuthOption{
+func (b *BindedConnector) Connect(session uint32, options util.Map, channel io.ReadWriteCloser) (back *AuthOption, binded *BindedReadWriter, err error) {
+	option := &AuthOption{
 		Name:    b.Name,
 		Session: session,
-	})
+		Options: options,
+	}
+	data, err := json.Marshal(option)
+	if err != nil {
+		return
+	}
 	hash := hashSha1(b.AuthKey, data)
 	authData := make([]byte, b.Offset+len(data)+20)
 	copy(authData[b.Offset:], hash)
@@ -186,7 +207,7 @@ func (b *BindedConnector) Connect(session uint32, channel io.ReadWriteCloser) (n
 		return
 	}
 	buf = buf[:readed]
-	back := &AuthOption{}
+	back = &AuthOption{}
 	err = json.Unmarshal(buf[b.Offset:], back)
 	if err != nil {
 		err = fmt.Errorf("pass auth return fail with %v", err)
@@ -198,6 +219,7 @@ func (b *BindedConnector) Connect(session uint32, channel io.ReadWriteCloser) (n
 	if binded == nil {
 		binded = NewBindedReadWriter(b.BufferSize, b.ReadChanSize, b.BindMax)
 		b.allBinded[back.Session] = binded
+		binded.Userinfo = option
 		if ShowLog > 0 {
 			log.D("BindedConnector(%v) bind conn by new session(%v)", b, back.Session)
 		}
@@ -207,7 +229,6 @@ func (b *BindedConnector) Connect(session uint32, channel io.ReadWriteCloser) (n
 		}
 	}
 	b.bindedLck.Unlock()
-	newSession = back.Session
 	err = binded.Bind(channel, channel)
 	return
 }
@@ -400,6 +421,7 @@ func (b *BindedWriter) String() string {
 type BindedReadWriter struct {
 	*BindedReader
 	*BindedWriter
+	Userinfo interface{}
 }
 
 func NewBindedReadWriter(bufferSize, readChanSize, max int) (binded *BindedReadWriter) {
