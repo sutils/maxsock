@@ -104,8 +104,8 @@ func TestChannelPipe(t *testing.T) {
 
 func TestFrameReadWriter(t *testing.T) {
 	reader, writer := io.Pipe()
-	frameReader := NewFrameReader(reader)
-	frameWriter := NewFrameWriter(writer)
+	frameReader := NewFrameReader(reader, 0)
+	frameWriter := NewFrameWriter(writer, 0)
 	wg := sync.WaitGroup{}
 	wg.Add(100)
 	go func() {

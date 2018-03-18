@@ -5,24 +5,318 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net"
+	"sync"
 	"time"
 
 	"github.com/Centny/gwf/log"
+	"github.com/Centny/gwf/util"
 )
 
-var ShowLog int = 2
+type udpConn struct {
+	remote   net.Addr
+	conn     *net.UDPConn
+	readChan chan []byte
+	OnClose  func(u *udpConn)
+}
+
+func newUDPConn(conn *net.UDPConn, remote net.Addr, onclose func(u *udpConn)) (udp *udpConn) {
+	udp = &udpConn{
+		remote:   remote,
+		conn:     conn,
+		readChan: make(chan []byte, 64),
+		OnClose:  onclose,
+	}
+	return
+}
+
+func (u *udpConn) Read(p []byte) (n int, err error) {
+	buf := <-u.readChan
+	if buf == nil {
+		err = fmt.Errorf("connection is closed")
+		return
+	}
+	if len(p) < len(buf) {
+		err = fmt.Errorf("read buffer is smaller to data, expect %v, but %v found", len(buf), len(p))
+		return
+	}
+	copy(p, buf)
+	n = len(buf)
+	return
+}
+
+func (u *udpConn) Write(p []byte) (n int, err error) {
+	n, err = u.conn.WriteTo(p, u.remote)
+	return
+}
+
+func (u *udpConn) Close() (err error) {
+	close(u.readChan)
+	u.OnClose(u)
+	return
+}
+
+type ConsistentListenerEvent interface {
+	OnAccept(c *ConsistentListener, conn io.ReadWriteCloser, option *AuthOption, offset int) (err error)
+}
+
+type ConsistentListener struct {
+	Acceptor       *BindedAcceptor
+	allTCPListener map[*net.TCPListener]int
+	allUDPListener map[*net.UDPConn]int
+	allUDPConn     map[string]*udpConn
+	allUDPLck      sync.RWMutex
+	Event          ConsistentListenerEvent
+	BufferSize     int //the buffer size of read runner.
+	ReadChanSize   int
+	QueueMax       uint16 //the max of queued data
+	Offset         int
+
+	running    bool
+	acceptChan chan io.ReadWriteCloser
+}
+
+func NewConsistentListener(bufferSize, readChanSize, bindMax int, queueMax uint16, offset int, event ConsistentListenerEvent) (listener *ConsistentListener) {
+	listener = &ConsistentListener{
+		BufferSize:     bufferSize,
+		ReadChanSize:   readChanSize,
+		QueueMax:       queueMax,
+		acceptChan:     make(chan io.ReadWriteCloser, 8),
+		running:        true,
+		allTCPListener: map[*net.TCPListener]int{},
+		allUDPListener: map[*net.UDPConn]int{},
+		allUDPConn:     map[string]*udpConn{},
+		allUDPLck:      sync.RWMutex{},
+		Event:          event,
+		Offset:         offset,
+	}
+	listener.Acceptor = NewBindedAcceptor(bufferSize, readChanSize, bindMax, listener.Offset+FrameOffset)
+	listener.Acceptor.Event = listener
+	go listener.runConsistentAccept()
+	return
+}
+
+func (c *ConsistentListener) ListenTCP(network, addr string) (err error) {
+	tcpAddr, err := net.ResolveTCPAddr(network, addr)
+	if err != nil {
+		return
+	}
+	listener, err := net.ListenTCP(network, tcpAddr)
+	if err == nil {
+		log.D("ConsistentListener(%v) listen tcp on %v", c, addr)
+		c.allTCPListener[listener] = 1
+		go c.runAcceptTCP(listener)
+	}
+	return
+}
+
+func (c *ConsistentListener) runAcceptTCP(listener *net.TCPListener) (err error) {
+	var rawCon net.Conn
+	for c.running {
+		rawCon, err = listener.Accept()
+		if err != nil {
+			return
+		}
+		log.D("ConsistentListener(%v) accept tcp connection from %v", c, rawCon.RemoteAddr())
+		frameReader := NewFrameReader(rawCon, c.Offset)
+		frameWriter := NewFrameWriter(rawCon, c.Offset)
+		frameCon := NewAutoCloseReadWriter(frameReader, frameWriter)
+		c.acceptChan <- frameCon
+	}
+	log.D("ConsistentListener(%v) the tcp accept runner is stopped", c)
+	return
+}
+
+func (c *ConsistentListener) ListenUDP(network, addr string) (err error) {
+	udpAddr, err := net.ResolveUDPAddr(network, addr)
+	if err != nil {
+		return
+	}
+	listener, err := net.ListenUDP(network, udpAddr)
+	if err == nil {
+		c.allUDPListener[listener] = 1
+		go c.runAcceptUDP(listener)
+	}
+	return
+}
+
+func (c *ConsistentListener) runAcceptUDP(listener *net.UDPConn) (err error) {
+	for c.running {
+		buf := make([]byte, c.BufferSize)
+		readed, remote, rerr := listener.ReadFrom(buf)
+		if rerr != nil {
+			err = rerr
+			return
+		}
+		address := remote.String()
+		conn := c.allUDPConn[address]
+		if conn == nil {
+			conn = newUDPConn(listener, remote, c.onUDPClose)
+			c.allUDPConn[address] = conn
+			log.D("ConsistentListener(%v) accept udp connection from %v", c, address)
+			frameReader := conn
+			frameWriter := NewFrameWriter(conn, c.Offset)
+			frameCon := NewAutoCloseReadWriter(frameReader, frameWriter)
+			c.acceptChan <- frameCon
+		}
+		conn.readChan <- buf[:readed]
+	}
+	log.D("ConsistentListener(%v) the udp accept runner is stopped", c)
+	return
+}
+
+func (c *ConsistentListener) onUDPClose(u *udpConn) {
+	c.allUDPLck.Lock()
+	delete(c.allUDPConn, u.remote.String())
+	c.allUDPLck.Unlock()
+}
+
+func (c *ConsistentListener) runConsistentAccept() (err error) {
+	for c.running {
+		rawCon := <-c.acceptChan
+		if rawCon == nil {
+			break
+		}
+		option, _, err := c.Acceptor.Accept(rawCon)
+		if err != nil {
+			log.D("ConsistentListener(%v) accept to binded fail with %v", c, err)
+			rawCon.Close()
+		} else {
+			log.D("ConsistentListener(%v) accept to binded(%v) by name(%v) success", c, option.Session, option.Name)
+		}
+	}
+	log.D("ConsistentListener(%v) the consistent accept runner is stopped", c)
+	return
+}
+
+func (c *ConsistentListener) OnAccept(b *BindedAcceptor, channel io.ReadWriteCloser, option *AuthOption) (err error) {
+	conn := NewConsistentReadWriter(channel, c.BufferSize, c.ReadChanSize, c.QueueMax, c.Offset+FrameOffset)
+	err = c.Event.OnAccept(c, conn, option, c.Offset+FrameOffset+ConsistentOffset)
+	return
+}
+
+func (c *ConsistentListener) Close() (err error) {
+	for listener := range c.allTCPListener {
+		cerr := listener.Close()
+		if cerr != nil {
+			err = cerr
+		}
+	}
+	for listener := range c.allUDPListener {
+		cerr := listener.Close()
+		if cerr != nil {
+			err = cerr
+		}
+	}
+	for _, conn := range c.allUDPConn {
+		cerr := conn.Close()
+		if cerr != nil {
+			err = cerr
+		}
+	}
+	cerr := c.Acceptor.Close()
+	if cerr != nil {
+		err = cerr
+	}
+	close(c.acceptChan)
+	return
+}
+
+type ConsistentConnector struct {
+	Connector    *BindedConnector
+	BufferSize   int //the buffer size of read runner.
+	ReadChanSize int
+	QueueMax     uint16 //the max of queued data
+	Offset       int
+}
+
+func NewConsistentConnector(name, authKey string, bufferSize, readChanSize, bindMax int, queueMax uint16, offset int) (conn *ConsistentConnector) {
+	conn = &ConsistentConnector{
+		BufferSize:   bufferSize,
+		ReadChanSize: readChanSize,
+		QueueMax:     queueMax,
+		Offset:       offset,
+	}
+	conn.Connector = NewBindedConnector(name, authKey, bufferSize, readChanSize, bindMax, conn.Offset+FrameOffset)
+	return
+}
+
+func (c *ConsistentConnector) DailTCP(network, local, remote string, session uint32, options util.Map) (back *AuthOption, conn io.ReadWriteCloser, offset int, err error) {
+	localAddr, err := net.ResolveTCPAddr(network, local)
+	if err != nil {
+		return
+	}
+	remoteAddr, err := net.ResolveTCPAddr(network, remote)
+	if err != nil {
+		return
+	}
+	tcpConn, err := net.DialTCP(network, localAddr, remoteAddr)
+	if err != nil {
+		return
+	}
+	frameReader := NewFrameReader(tcpConn, c.Offset)
+	frameWriter := NewFrameWriter(tcpConn, c.Offset)
+	frameCon := NewAutoCloseReadWriter(frameReader, frameWriter)
+	back, binded, err := c.Connector.Connect(session, options, frameCon)
+	if err == nil {
+		conn = NewConsistentReadWriter(binded, c.BufferSize, c.ReadChanSize, c.QueueMax, c.Offset+FrameOffset)
+	}
+	offset = c.Offset + FrameOffset + ConsistentOffset
+	log.D("ConsistentConnector(%v) connect to %v by local(%v),session(%v)", c, remote, local, back.Session)
+	return
+}
+
+func (c *ConsistentConnector) DailUDP(network, local, remote string, session uint32, options util.Map) (back *AuthOption, conn io.ReadWriteCloser, offset int, err error) {
+	localAddr, err := net.ResolveUDPAddr(network, local)
+	if err != nil {
+		return
+	}
+	remoteAddr, err := net.ResolveUDPAddr(network, remote)
+	if err != nil {
+		return
+	}
+	udpConn, err := net.DialUDP(network, localAddr, remoteAddr)
+	if err != nil {
+		return
+	}
+	frameReader := udpConn
+	frameWriter := NewFrameWriter(udpConn, c.Offset)
+	frameCon := NewAutoCloseReadWriter(frameReader, frameWriter)
+	back, binded, err := c.Connector.Connect(session, options, frameCon)
+	if err == nil {
+		conn = NewConsistentReadWriter(binded, c.BufferSize, c.ReadChanSize, c.QueueMax, c.Offset+FrameOffset)
+	}
+	offset = c.Offset + FrameOffset + ConsistentOffset
+	return
+}
 
 type ConsistentReadWriter struct {
 	*ConsistentReader
 	*ConsistentWriter
 }
 
-func NewConsistentReadWriter(channel io.ReadWriter, bufferSize, readChanSize int, queueMax uint16) (conn *ConsistentReadWriter) {
-	writer := NewConsistentWriter(channel, queueMax)
-	reader := NewConsistentReader(writer, channel, bufferSize, readChanSize, queueMax)
+func NewConsistentReadWriter(channel io.ReadWriter, bufferSize, readChanSize int, queueMax uint16, offset int) (conn *ConsistentReadWriter) {
+	writer := NewConsistentWriter(channel, queueMax, offset)
+	reader := NewConsistentReader(writer, channel, bufferSize, readChanSize, queueMax, offset)
 	conn = &ConsistentReadWriter{
 		ConsistentReader: reader,
 		ConsistentWriter: writer,
+	}
+	return
+}
+
+func (c *ConsistentReadWriter) Close() (err error) {
+	if closer, ok := c.ConsistentReader.Raw.(io.Closer); ok {
+		xerr := closer.Close()
+		if xerr != nil {
+			err = xerr
+		}
+	}
+	if closer, ok := c.ConsistentWriter.Raw.(io.Closer); ok {
+		xerr := closer.Close()
+		if xerr != nil {
+			err = xerr
+		}
 	}
 	return
 }
@@ -32,6 +326,8 @@ type ConsistentReaderEvent interface {
 	OnSendHeartbeat(c *ConsistentReader, current uint16, missing []uint16) (err error)
 	OnRecvHeartbeat(c *ConsistentReader, current uint16, missing []uint16) (err error)
 }
+
+const ConsistentOffset = 4
 
 //ConsistentReader is the reader to process data to be consistent
 //more 4 byte is required when process read buffer, real data is 4 byte offset from begin.
@@ -52,9 +348,10 @@ type ConsistentReader struct {
 }
 
 //NewConsistentReader is the creator of ConsistentReader by event handler, raw writer, buffer size, read cache size and the max of queued data
-func NewConsistentReader(event ConsistentReaderEvent, raw io.Reader, bufferSize, readChanSize int, queueMax uint16) (reader *ConsistentReader) {
+func NewConsistentReader(event ConsistentReaderEvent, raw io.Reader, bufferSize, readChanSize int, queueMax uint16, offset int) (reader *ConsistentReader) {
 	reader = &ConsistentReader{
 		Raw:        raw,
+		Offset:     offset,
 		readChan:   make(chan []byte, readChanSize),
 		taskChan:   make(chan []byte, readChanSize),
 		BufferSize: bufferSize,
@@ -138,8 +435,6 @@ func (c *ConsistentReader) runRead() {
 				}
 			}
 			c.missing = missing
-			// fmt.Println("--->", c.currentIdx, dataIdx, receivedMax, missing, dmax, adis)
-			//98 98 4 [99 100 101] 98
 			if uint16(len(missing)) > c.QueueMax/2 {
 				taskBuf := make([]byte, c.Offset+1)
 				taskBuf[c.Offset] = 20
@@ -200,9 +495,10 @@ type ConsistentWriter struct {
 }
 
 //NewConsistentWriter is the creator of ConsistentWriter by raw writer and the max of queued data
-func NewConsistentWriter(raw io.Writer, queueMax uint16) (writer *ConsistentWriter) {
+func NewConsistentWriter(raw io.Writer, queueMax uint16, offset int) (writer *ConsistentWriter) {
 	writer = &ConsistentWriter{
 		Raw:        raw,
+		Offset:     offset,
 		writeLck:   make(chan int, 1),
 		writeLimit: make(chan int, queueMax),
 		queue:      map[uint16][]byte{},

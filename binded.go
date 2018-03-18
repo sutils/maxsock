@@ -16,8 +16,8 @@ import (
 type AuthOption struct {
 	Name    string   `json:"name"`
 	Session uint32   `json:"session"`
-	Error   error    `json:"error"`
-	Options util.Map `json:"options`
+	Error   string   `json:"error"`
+	Options util.Map `json:"options"`
 }
 
 func WriteJSON(w io.Writer, offset int, v interface{}) (n int, err error) {
@@ -60,9 +60,10 @@ type BindedAcceptor struct {
 	sequence   uint32
 }
 
-func NewBindedAcceptor(bufferSize, readChanSize, bindMax int) (acceptor *BindedAcceptor) {
+func NewBindedAcceptor(bufferSize, readChanSize, bindMax, offset int) (acceptor *BindedAcceptor) {
 	acceptor = &BindedAcceptor{
 		BufferSize:   bufferSize,
+		Offset:       offset,
 		ReadChanSize: readChanSize,
 		BindMax:      bindMax,
 		AuthKey:      map[string]string{},
@@ -79,13 +80,17 @@ func (b *BindedAcceptor) Accept(channel io.ReadWriteCloser) (option *AuthOption,
 	if err != nil {
 		return
 	}
+	if readed < b.Offset+20 {
+		err = fmt.Errorf("receive bad data")
+		return
+	}
 	buf = buf[:readed]
 	option = &AuthOption{}
 	back := &AuthOption{}
 	err = json.Unmarshal(buf[b.Offset+20:], option)
 	if err != nil {
 		err = fmt.Errorf("pass auth option fail with %v", err)
-		back.Error = err
+		back.Error = err.Error()
 		log.W("BindedAcceptor(%v) %v", b, err)
 		_, err = WriteJSON(channel, b.Offset, back)
 		return
@@ -98,21 +103,12 @@ func (b *BindedAcceptor) Accept(channel io.ReadWriteCloser) (option *AuthOption,
 	hash := hashSha1(authKey, buf[b.Offset+20:])
 	if bytes.Compare(hash, buf[b.Offset:b.Offset+20]) != 0 {
 		err = fmt.Errorf("auth fail")
-		back.Error = err
+		back.Error = err.Error()
 		log.W("BindedAcceptor(%v) auth fail with hash not match", b)
 		_, err = WriteJSON(channel, b.Offset, back)
 		return
 	}
 	//
-	if b.Event != nil {
-		err = b.Event.OnAccept(b, channel, option)
-		if err != nil {
-			back.Error = err
-			log.W("BindedAcceptor(%v) event on accept fail with %v", b, err)
-			_, err = WriteJSON(channel, b.Offset, back)
-			return
-		}
-	}
 	//
 	if option.Session > 0 {
 		b.bindedLck.Lock()
@@ -120,12 +116,12 @@ func (b *BindedAcceptor) Accept(channel io.ReadWriteCloser) (option *AuthOption,
 		b.bindedLck.Unlock()
 		if binded == nil {
 			err = fmt.Errorf("session not found by session(%v)", option.Session)
-			back.Error = err
+			back.Error = err.Error()
 			log.W("BindedAcceptor(%v) %v", b, err)
 			_, err = WriteJSON(channel, b.Offset, back)
 			return
 		}
-		back.Error = nil
+		back.Error = ""
 		back.Session = option.Session
 		_, err = WriteJSON(channel, b.Offset, back)
 		if err != nil {
@@ -137,20 +133,43 @@ func (b *BindedAcceptor) Accept(channel io.ReadWriteCloser) (option *AuthOption,
 		}
 		return
 	}
-	back.Error = nil
+	back.Error = ""
 	back.Session = atomic.AddUint32(&b.sequence, 1)
+	option.Session = back.Session
 	_, err = WriteJSON(channel, b.Offset, back)
-	if err == nil {
-		binded = NewBindedReadWriter(b.BufferSize, b.ReadChanSize, b.BindMax)
-		binded.Userinfo = option
-		b.bindedLck.Lock()
-		b.allBinded[back.Session] = binded
-		b.bindedLck.Unlock()
-		err = binded.Bind(channel, channel)
-		if ShowLog > 0 {
-			log.D("BindedAcceptor(%v) bind conn by new session(%v)", b, back.Session)
+	if err != nil {
+		return
+	}
+	binded = NewBindedReadWriter(b.BufferSize, b.ReadChanSize, b.BindMax)
+	binded.Userinfo = option
+	binded.Bind(channel, channel)
+	if b.Event != nil {
+		err = b.Event.OnAccept(b, binded, option)
+		if err != nil {
+			back.Error = err.Error()
+			log.W("BindedAcceptor(%v) event on accept fail with %v", b, err)
+			_, err = WriteJSON(channel, b.Offset, back)
+			return
 		}
 	}
+	b.bindedLck.Lock()
+	b.allBinded[back.Session] = binded
+	b.bindedLck.Unlock()
+	if ShowLog > 0 {
+		log.D("BindedAcceptor(%v) bind conn by new session(%v)", b, back.Session)
+	}
+	return
+}
+
+func (b *BindedAcceptor) Close() (err error) {
+	b.bindedLck.Lock()
+	for _, binded := range b.allBinded {
+		cerr := binded.Close()
+		if cerr != nil {
+			err = cerr
+		}
+	}
+	b.bindedLck.Unlock()
 	return
 }
 
@@ -169,11 +188,12 @@ type BindedConnector struct {
 	bindedLck    sync.RWMutex
 }
 
-func NewBindedConnector(name, authKey string, bufferSize, readChanSize, bindMax int) (connector *BindedConnector) {
+func NewBindedConnector(name, authKey string, bufferSize, readChanSize, bindMax, offset int) (connector *BindedConnector) {
 	connector = &BindedConnector{
 		Name:         name,
 		AuthKey:      authKey,
 		BufferSize:   bufferSize,
+		Offset:       offset,
 		ReadChanSize: readChanSize,
 		BindMax:      bindMax,
 		allBinded:    map[uint32]*BindedReadWriter{},
@@ -230,6 +250,18 @@ func (b *BindedConnector) Connect(session uint32, options util.Map, channel io.R
 	}
 	b.bindedLck.Unlock()
 	err = binded.Bind(channel, channel)
+	return
+}
+
+func (b *BindedConnector) Close() (err error) {
+	b.bindedLck.Lock()
+	for _, binded := range b.allBinded {
+		cerr := binded.Close()
+		if cerr != nil {
+			err = cerr
+		}
+	}
+	b.bindedLck.Unlock()
 	return
 }
 

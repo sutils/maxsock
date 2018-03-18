@@ -4,22 +4,104 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"strconv"
 	"sync"
 	"testing"
 	"time"
 )
 
+type ConsistentCallback struct {
+	wg sync.WaitGroup
+}
+
+func (c *ConsistentCallback) OnAccept(cl *ConsistentListener, conn io.ReadWriteCloser, option *AuthOption, offset int) (err error) {
+	go c.runConn(conn, offset)
+	return
+}
+
+func (c *ConsistentCallback) runConn(conn io.ReadWriteCloser, offset int) {
+	buf := make([]byte, 1024)
+	for {
+		readed, err := conn.Read(buf)
+		if err != nil {
+			break
+		}
+		if string(buf[offset:readed]) != "1234567890" {
+			panic("error")
+		}
+		c.wg.Done()
+	}
+}
+
+func TestConsistentTCP(t *testing.T) {
+	ShowLog = 1
+	callback := &ConsistentCallback{wg: sync.WaitGroup{}}
+	listener := NewConsistentListener(1024, 64, 8, 1024, 0, callback)
+	listener.Acceptor.AuthKey["abc"] = "123"
+	err := listener.ListenTCP("tcp", ":7233")
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	connector := NewConsistentConnector("abc", "123", 1024, 64, 8, 1024, 0)
+	_, conn, _, err := connector.DailTCP("tcp", ":0", "localhost:7233", 0, nil)
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	callback.wg.Add(100)
+	for i := 0; i < 100; i++ {
+		go func() {
+			buf := make([]byte, 18)
+			copy(buf[8:], []byte("1234567890"))
+			_, err := conn.Write(buf)
+			if err != nil {
+				panic(err)
+			}
+		}()
+	}
+	callback.wg.Wait()
+}
+
+func TestConsistentUDP(t *testing.T) {
+	ShowLog = 1
+	callback := &ConsistentCallback{wg: sync.WaitGroup{}}
+	listener := NewConsistentListener(1024, 64, 8, 1024, 0, callback)
+	listener.Acceptor.AuthKey["abc"] = "123"
+	err := listener.ListenUDP("udp", ":7233")
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	connector := NewConsistentConnector("abc", "123", 1024, 64, 8, 1024, 0)
+	_, conn, _, err := connector.DailUDP("udp", ":0", "localhost:7233", 0, nil)
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	callback.wg.Add(100)
+	for i := 0; i < 100; i++ {
+		go func() {
+			buf := make([]byte, 18)
+			copy(buf[8:], []byte("1234567890"))
+			_, err := conn.Write(buf)
+			if err != nil {
+				panic(err)
+			}
+		}()
+	}
+	callback.wg.Wait()
+}
+
 func TestConsistentReadWriterBasic(t *testing.T) {
 	bindedReader, bindedWriter, err := pipeBindedReadWriter()
 	if err != nil {
 		return
 	}
-	consWriter := NewConsistentWriter(bindedWriter, 1024)
-	consWriter.Offset = 4
+	consWriter := NewConsistentWriter(bindedWriter, 1024, 4)
 	// consWriter.Copy = true
-	consReader := NewConsistentReader(consWriter, bindedReader, 1024, 100, 1024)
-	consReader.Offset = 4
+	consReader := NewConsistentReader(consWriter, bindedReader, 1024, 100, 1024, 4)
 	//
 	wg := sync.WaitGroup{}
 	wg.Add(100)
@@ -69,15 +151,11 @@ func pipeConsistentReadWriter() (connA, connB *AutoCloseReadWriter, err error) {
 	if err != nil {
 		return
 	}
-	consWriterA := NewConsistentWriter(bindedWriterA, 10240)
-	consWriterA.Offset = 4
-	consWriterB := NewConsistentWriter(bindedWriterB, 10240)
-	consWriterB.Offset = 4
+	consWriterA := NewConsistentWriter(bindedWriterA, 10240, 4)
+	consWriterB := NewConsistentWriter(bindedWriterB, 10240, 4)
 	// consWriter.Copy = true
-	consReaderA := NewConsistentReader(consWriterA, bindedReaderB, 1024, 100, 10240)
-	consReaderA.Offset = 4
-	consReaderB := NewConsistentReader(consWriterB, bindedReaderA, 1024, 100, 10240)
-	consReaderB.Offset = 4
+	consReaderA := NewConsistentReader(consWriterA, bindedReaderB, 1024, 100, 10240, 4)
+	consReaderB := NewConsistentReader(consWriterB, bindedReaderA, 1024, 100, 10240, 4)
 	// consWriter.Copy = true
 	connA = NewAutoCloseReadWriter(consReaderA, consWriterA)
 	connB = NewAutoCloseReadWriter(consReaderB, consWriterB)

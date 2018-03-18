@@ -8,17 +8,15 @@ import (
 
 func pipeFrameReadWriter() (reader *FrameReader, writer *FrameWriter) {
 	rawReader, rawWriter := io.Pipe()
-	reader = NewFrameReader(rawReader)
-	writer = NewFrameWriter(rawWriter)
+	reader = NewFrameReader(rawReader, 0)
+	writer = NewFrameWriter(rawWriter, 0)
 	return
 }
 
 func TestBindedConn(t *testing.T) {
-	acceptor := NewBindedAcceptor(1024, 1024, 3)
+	acceptor := NewBindedAcceptor(1024, 1024, 3, 4)
 	acceptor.AuthKey["abc"] = "123"
-	acceptor.Offset = 4
-	connector := NewBindedConnector("abc", "123", 1024, 1024, 3)
-	connector.Offset = 4
+	connector := NewBindedConnector("abc", "123", 1024, 1024, 3, 4)
 	var err error
 	var back = &AuthOption{}
 	var connA, connB *BindedReadWriter
@@ -69,8 +67,8 @@ func TestBindedReadWriter(t *testing.T) {
 	bindedWriter := NewBindedWriter(3)
 	for i := 0; i < 3; i++ {
 		reader, writer := io.Pipe()
-		frameReader := NewFrameReader(reader)
-		frameWriter := NewFrameWriter(writer)
+		frameReader := NewFrameReader(reader, 0)
+		frameWriter := NewFrameWriter(writer, 0)
 		err := bindedReader.Bind(NewNoneCloserReader(frameReader))
 		if err != nil {
 			t.Error(err)
@@ -123,8 +121,8 @@ func pipeBindedReadWriter() (reader *BindedReader, writer *BindedWriter, err err
 	bindedWriter := NewBindedWriter(3)
 	for i := 0; i < 1; i++ {
 		rawReader, rawWriter := io.Pipe()
-		frameReader := NewFrameReader(rawReader)
-		frameWriter := NewFrameWriter(rawWriter)
+		frameReader := NewFrameReader(rawReader, 0)
+		frameWriter := NewFrameWriter(rawWriter, 0)
 		err = bindedReader.Bind(NewNoneCloserReader(frameReader))
 		if err != nil {
 			return

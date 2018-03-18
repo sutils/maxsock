@@ -6,6 +6,10 @@ import (
 	"io"
 )
 
+var ShowLog int = 2
+
+const FrameOffset = 4
+
 //FrameReader impl the reader to read data as frame.
 //for more info about FrameReader, see FrameReader.Read.
 type FrameReader struct {
@@ -14,9 +18,10 @@ type FrameReader struct {
 }
 
 //NewFrameReader is creator by raw reader.
-func NewFrameReader(raw io.Reader) (reader *FrameReader) {
+func NewFrameReader(raw io.Reader, offset int) (reader *FrameReader) {
 	reader = &FrameReader{
-		Raw: raw,
+		Raw:    raw,
+		Offset: offset,
 	}
 	return
 }
@@ -53,6 +58,7 @@ func (f *FrameReader) Read(p []byte) (n int, err error) {
 		//one frame readed
 		break
 	}
+	// fmt.Println("r-->", p[:n])
 	return
 }
 
@@ -68,9 +74,10 @@ type FrameWriter struct {
 }
 
 //NewFrameWriter is creator by raw writer.
-func NewFrameWriter(raw io.Writer) (writer *FrameWriter) {
+func NewFrameWriter(raw io.Writer, offset int) (writer *FrameWriter) {
 	writer = &FrameWriter{
-		Raw: raw,
+		Raw:    raw,
+		Offset: offset,
 	}
 	return
 }
@@ -79,6 +86,7 @@ func NewFrameWriter(raw io.Writer) (writer *FrameWriter) {
 //so the total size of buffer is 4 byte more than the data size.
 func (f *FrameWriter) Write(p []byte) (n int, err error) {
 	binary.BigEndian.PutUint32(p, uint32(len(p)))
+	// fmt.Println("w-->", p)
 	n, err = f.Raw.Write(p)
 	return
 }
