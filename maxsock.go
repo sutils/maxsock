@@ -6,7 +6,7 @@ import (
 	"io"
 )
 
-var ShowLog int = 2
+var ShowLog int = 0
 
 const FrameOffset = 4
 

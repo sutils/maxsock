@@ -237,6 +237,10 @@ func (c *ConsistentListener) Close() (err error) {
 	return
 }
 
+func (c *ConsistentListener) String() string {
+	return fmt.Sprintf("%p", c)
+}
+
 type ConsistentConnector struct {
 	Connector    *BindedConnector
 	BufferSize   int //the buffer size of read runner.
@@ -441,7 +445,7 @@ func NewConsistentReader(event ConsistentReaderEvent, raw io.Reader, bufferSize,
 		BufferSize: bufferSize,
 		event:      event,
 		running:    true,
-		Heartbeat:  500 * time.Millisecond,
+		Heartbeat:  1000 * time.Millisecond,
 		QueueMax:   queueMax,
 	}
 	go reader.runRead()
