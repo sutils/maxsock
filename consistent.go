@@ -74,6 +74,8 @@ type ConsistentListener struct {
 
 	running    bool
 	acceptChan chan io.ReadWriteCloser
+	connected  map[io.ReadWriteCloser]*ConsistentReadWriter
+	connLck    sync.RWMutex
 }
 
 func NewConsistentListener(bufferSize, readChanSize, bindMax int, queueMax uint16, offset int, event ConsistentListenerEvent) (listener *ConsistentListener) {
@@ -89,6 +91,8 @@ func NewConsistentListener(bufferSize, readChanSize, bindMax int, queueMax uint1
 		allUDPLck:      sync.RWMutex{},
 		Event:          event,
 		Offset:         offset,
+		connected:      map[io.ReadWriteCloser]*ConsistentReadWriter{},
+		connLck:        sync.RWMutex{},
 	}
 	listener.Acceptor = NewBindedAcceptor(bufferSize, readChanSize, bindMax, listener.Offset+FrameOffset)
 	listener.Acceptor.Event = listener
@@ -190,8 +194,14 @@ func (c *ConsistentListener) runConsistentAccept() (err error) {
 }
 
 func (c *ConsistentListener) OnAccept(b *BindedAcceptor, channel io.ReadWriteCloser, option *AuthOption) (err error) {
-	conn := NewConsistentReadWriter(channel, c.BufferSize, c.ReadChanSize, c.QueueMax, c.Offset+FrameOffset)
-	err = c.Event.OnAccept(c, conn, option, c.Offset+FrameOffset+ConsistentOffset)
+	c.connLck.Lock()
+	consistent := c.connected[channel]
+	if consistent == nil {
+		consistent = NewConsistentReadWriter(channel, c.BufferSize, c.ReadChanSize, c.QueueMax, c.Offset+FrameOffset)
+		c.connected[channel] = consistent
+	}
+	c.connLck.Unlock()
+	err = c.Event.OnAccept(c, consistent, option, c.Offset+FrameOffset+ConsistentOffset)
 	return
 }
 
@@ -233,6 +243,8 @@ type ConsistentConnector struct {
 	ReadChanSize int
 	QueueMax     uint16 //the max of queued data
 	Offset       int
+	connected    map[*BindedReadWriter]*ConsistentReadWriter
+	connLck      sync.RWMutex
 }
 
 func NewConsistentConnector(name, authKey string, bufferSize, readChanSize, bindMax int, queueMax uint16, offset int) (conn *ConsistentConnector) {
@@ -241,6 +253,8 @@ func NewConsistentConnector(name, authKey string, bufferSize, readChanSize, bind
 		ReadChanSize: readChanSize,
 		QueueMax:     queueMax,
 		Offset:       offset,
+		connected:    map[*BindedReadWriter]*ConsistentReadWriter{},
+		connLck:      sync.RWMutex{},
 	}
 	conn.Connector = NewBindedConnector(name, authKey, bufferSize, readChanSize, bindMax, conn.Offset+FrameOffset)
 	return
@@ -263,11 +277,28 @@ func (c *ConsistentConnector) DailTCP(network, local, remote string, session uin
 	frameWriter := NewFrameWriter(tcpConn, c.Offset)
 	frameCon := NewAutoCloseReadWriter(frameReader, frameWriter)
 	back, binded, err := c.Connector.Connect(session, options, frameCon)
-	if err == nil {
-		conn = NewConsistentReadWriter(binded, c.BufferSize, c.ReadChanSize, c.QueueMax, c.Offset+FrameOffset)
+	if err != nil {
+		return
 	}
+	c.connLck.Lock()
+	consistent := c.connected[binded]
+	if consistent == nil {
+		consistent = NewConsistentReadWriter(binded, c.BufferSize, c.ReadChanSize, c.QueueMax, c.Offset+FrameOffset)
+		c.connected[binded] = consistent
+	}
+	c.connLck.Unlock()
+	conn = consistent
+	binded.Event = c
+	frameCon.Userinfo = util.Map{
+		"type":    "tcp",
+		"network": network,
+		"local":   local,
+		"remote":  remote,
+		"session": back.Session,
+		"options": options,
+	}
+	log.D("ConsistentConnector(%v) tcp connect to %v by local(%v),session(%v)", c, remote, local, back.Session)
 	offset = c.Offset + FrameOffset + ConsistentOffset
-	log.D("ConsistentConnector(%v) connect to %v by local(%v),session(%v)", c, remote, local, back.Session)
 	return
 }
 
@@ -288,11 +319,58 @@ func (c *ConsistentConnector) DailUDP(network, local, remote string, session uin
 	frameWriter := NewFrameWriter(udpConn, c.Offset)
 	frameCon := NewAutoCloseReadWriter(frameReader, frameWriter)
 	back, binded, err := c.Connector.Connect(session, options, frameCon)
-	if err == nil {
-		conn = NewConsistentReadWriter(binded, c.BufferSize, c.ReadChanSize, c.QueueMax, c.Offset+FrameOffset)
+	if err != nil {
+		return
 	}
+	c.connLck.Lock()
+	consistent := c.connected[binded]
+	if consistent == nil {
+		consistent = NewConsistentReadWriter(binded, c.BufferSize, c.ReadChanSize, c.QueueMax, c.Offset+FrameOffset)
+		c.connected[binded] = consistent
+	}
+	c.connLck.Unlock()
+	conn = consistent
+	binded.Event = c
+	frameCon.Userinfo = util.Map{
+		"type":    "udp",
+		"network": network,
+		"local":   local,
+		"remote":  remote,
+		"session": back.Session,
+		"options": options,
+	}
+	log.D("ConsistentConnector(%v) udp connect to %v by local(%v),session(%v)", c, remote, local, back.Session)
 	offset = c.Offset + FrameOffset + ConsistentOffset
 	return
+}
+
+func (c *ConsistentConnector) OnRawDone(b *BindedReadWriter, raw io.Reader, err error) {
+	log.E("ConsistentConnector one raw is done with %v", err)
+	var session uint32
+	var ctype, network, local, remote string
+	info := raw.(*AutoCloseReadWriter).Userinfo.(util.Map)
+	rerr := info.ValidF(`
+		type,R|S,L:0;
+		network,R|S,L:0;
+		local,R|S,L:0;
+		remote,R|S,L:0;
+		session,R|I,R:0;
+		`, &ctype, &network, &local, &remote, &session)
+	if rerr != nil {
+		log.E("ConsistentConnector on raw done fail with %v", rerr)
+		return
+	}
+	for {
+		if ctype == "udp" {
+			_, _, _, rerr = c.DailUDP(network, local, remote, session, info.MapVal("options"))
+		} else {
+			_, _, _, rerr = c.DailTCP(network, local, remote, session, info.MapVal("options"))
+		}
+		if rerr == nil {
+			break
+		}
+		time.Sleep(time.Second)
+	}
 }
 
 type ConsistentReadWriter struct {

@@ -462,16 +462,30 @@ func (b *BindedWriter) String() string {
 	return fmt.Sprintf("%p,%v", b, b.Max)
 }
 
+type BindedReadWriterEvent interface {
+	//call it on the runner of per raw reader is stopped.
+	OnRawDone(b *BindedReadWriter, raw io.Reader, err error)
+}
+
 type BindedReadWriter struct {
 	*BindedReader
 	*BindedWriter
 	Userinfo interface{}
+	Event    BindedReadWriterEvent
 }
 
 func NewBindedReadWriter(bufferSize, readChanSize, max int) (binded *BindedReadWriter) {
-	return &BindedReadWriter{
+	binded = &BindedReadWriter{
 		BindedReader: NewBindedReader(bufferSize, readChanSize, max),
 		BindedWriter: NewBindedWriter(max),
+	}
+	binded.BindedReader.Event = binded
+	return
+}
+
+func (b *BindedReadWriter) OnRawDone(r *BindedReader, raw io.Reader, err error) {
+	if b.Event != nil {
+		b.Event.OnRawDone(b, raw, err)
 	}
 }
 

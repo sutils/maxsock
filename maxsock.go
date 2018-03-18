@@ -160,6 +160,7 @@ func (n *NoneCloserReadWriter) String() string {
 type AutoCloseReadWriter struct {
 	io.Reader
 	io.Writer
+	Userinfo interface{}
 }
 
 func NewAutoCloseReadWriter(reader io.Reader, writer io.Writer) *AutoCloseReadWriter {

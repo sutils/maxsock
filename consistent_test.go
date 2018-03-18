@@ -64,6 +64,46 @@ func TestConsistentTCP(t *testing.T) {
 	callback.wg.Wait()
 }
 
+func TestConsistentTCP2(t *testing.T) {
+	ShowLog = 1
+	callback := &ConsistentCallback{wg: sync.WaitGroup{}}
+	listener := NewConsistentListener(1024, 64, 8, 1024, 0, callback)
+	listener.Acceptor.AuthKey["abc"] = "123"
+	err := listener.ListenTCP("tcp", ":7233")
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	connector := NewConsistentConnector("abc", "123", 1024, 64, 8, 1024, 0)
+	_, conn, _, err := connector.DailTCP("tcp", ":0", "localhost:7233", 0, nil)
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	callback.wg.Add(100)
+	for i := 0; i < 50; i++ {
+		buf := make([]byte, 18)
+		copy(buf[8:], []byte("1234567890"))
+		_, err := conn.Write(buf)
+		if err != nil {
+			panic(err)
+		}
+	}
+	for reader := range conn.(*ConsistentReadWriter).ConsistentReader.Raw.(*BindedReadWriter).BindedReader.binded {
+		reader.Close()
+	}
+	time.Sleep(time.Second)
+	for i := 0; i < 50; i++ {
+		buf := make([]byte, 18)
+		copy(buf[8:], []byte("1234567890"))
+		_, err := conn.Write(buf)
+		if err != nil {
+			panic(err)
+		}
+	}
+	callback.wg.Wait()
+}
+
 func TestConsistentUDP(t *testing.T) {
 	ShowLog = 1
 	callback := &ConsistentCallback{wg: sync.WaitGroup{}}
