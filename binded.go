@@ -85,8 +85,8 @@ func (b *BindedAcceptor) Accept(channel io.ReadWriteCloser) (option *AuthOption,
 		return
 	}
 	buf = buf[:readed]
-	option = &AuthOption{}
-	back := &AuthOption{}
+	option = &AuthOption{Options: util.Map{}}
+	back := &AuthOption{Options: util.Map{}}
 	err = json.Unmarshal(buf[b.Offset+20:], option)
 	if err != nil {
 		err = fmt.Errorf("pass auth option fail with %v", err)
@@ -161,6 +161,18 @@ func (b *BindedAcceptor) Accept(channel io.ReadWriteCloser) (option *AuthOption,
 	return
 }
 
+func (b *BindedAcceptor) CloseSession(sid uint32) (err error) {
+	b.bindedLck.Lock()
+	binded := b.allBinded[sid]
+	if binded == nil {
+		err = fmt.Errorf("not exist")
+	} else {
+		err = binded.Close()
+	}
+	b.bindedLck.Unlock()
+	return
+}
+
 func (b *BindedAcceptor) Close() (err error) {
 	b.bindedLck.Lock()
 	for _, binded := range b.allBinded {
@@ -227,7 +239,7 @@ func (b *BindedConnector) Connect(session uint32, options util.Map, channel io.R
 		return
 	}
 	buf = buf[:readed]
-	back = &AuthOption{}
+	back = &AuthOption{Options: util.Map{}}
 	err = json.Unmarshal(buf[b.Offset:], back)
 	if err != nil {
 		err = fmt.Errorf("pass auth return fail with %v", err)

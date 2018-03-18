@@ -62,6 +62,13 @@ func (f *FrameReader) Read(p []byte) (n int, err error) {
 	return
 }
 
+func (f *FrameReader) Close() (err error) {
+	if closer, ok := f.Raw.(io.Closer); ok {
+		err = closer.Close()
+	}
+	return
+}
+
 func (f *FrameReader) String() string {
 	return fmt.Sprintf("%p,%v,%p", f, f.Offset, f.Raw)
 }
@@ -86,8 +93,14 @@ func NewFrameWriter(raw io.Writer, offset int) (writer *FrameWriter) {
 //so the total size of buffer is 4 byte more than the data size.
 func (f *FrameWriter) Write(p []byte) (n int, err error) {
 	binary.BigEndian.PutUint32(p, uint32(len(p)))
-	// fmt.Println("w-->", p)
 	n, err = f.Raw.Write(p)
+	return
+}
+
+func (f *FrameWriter) Close() (err error) {
+	if closer, ok := f.Raw.(io.Closer); ok {
+		err = closer.Close()
+	}
 	return
 }
 

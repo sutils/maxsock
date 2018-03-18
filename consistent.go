@@ -195,6 +195,11 @@ func (c *ConsistentListener) OnAccept(b *BindedAcceptor, channel io.ReadWriteClo
 	return
 }
 
+func (c *ConsistentListener) CloseSession(sid uint32) (err error) {
+	err = c.Acceptor.CloseSession(sid)
+	return
+}
+
 func (c *ConsistentListener) Close() (err error) {
 	for listener := range c.allTCPListener {
 		cerr := listener.Close()
@@ -291,6 +296,7 @@ func (c *ConsistentConnector) DailUDP(network, local, remote string, session uin
 }
 
 type ConsistentReadWriter struct {
+	Userinfo interface{}
 	*ConsistentReader
 	*ConsistentWriter
 }
@@ -514,6 +520,10 @@ func NewConsistentWriter(raw io.Writer, queueMax uint16, offset int) (writer *Co
 }
 
 func (c *ConsistentWriter) Write(p []byte) (n int, err error) {
+	if len(p) < c.Offset+4 {
+		err = fmt.Errorf("buffer must be having at least %v byte offset", c.Offset+4)
+		return
+	}
 	<-c.writeLimit
 	//
 	//do idx

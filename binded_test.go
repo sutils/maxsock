@@ -13,6 +13,14 @@ func pipeFrameReadWriter() (reader *FrameReader, writer *FrameWriter) {
 	return
 }
 
+func pipeFrameReadWriter2() (a, b *AutoCloseReadWriter) {
+	readerA, writerB := pipeFrameReadWriter()
+	readerB, writerA := pipeFrameReadWriter()
+	a = NewAutoCloseReadWriter(readerA, writerA)
+	b = NewAutoCloseReadWriter(readerB, writerB)
+	return
+}
+
 func TestBindedConn(t *testing.T) {
 	acceptor := NewBindedAcceptor(1024, 1024, 3, 4)
 	acceptor.AuthKey["abc"] = "123"
